@@ -5,12 +5,408 @@
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+		<link rel="icon" type="image/svg+xml" href="/vercel-icon-effect/favicon.svg" />
 		<meta name="viewport" content="width=device-width" />
 		<meta name="generator" content={Astro.generator} />
 		<title>Astro</title>
 	</head>
 	<body>
-		<h1>Astro</h1>
+		<canvas id="icon-canvas" width="150" height="150"></canvas>
 	</body>
 </html>
+<script>
+	/**
+	 * Data about the SVG we will be using. Width and height are optional.
+	 */
+	interface Icon {
+		/**
+		 * The path to the icon (should be in the `public/` directory)
+		 */
+		path: string;
+		/**
+		 * The initial color of the icon when not hovered. Needs to be a hex color code.
+		 */
+		initialColor: string;
+		/**
+		 * The active color of the icon when hovered. Needs to be a hex color code.
+		 */
+		activeColor: string;
+		/**
+		 * The width of the icon. Useful if you want to add some padding. Doesn't need to be set.
+		 */
+		width?: number;
+		/**
+		 * The height of the icon. Useful if you want to add some padding. Doesn't need to be set.
+		 */
+		height?: number;	
+	}
+
+	/**
+	 * Callbacks that can be registered to be called when the mouse enters or leaves the canvas.
+	 */
+	interface Callback {
+		/**
+		 * The event to call the callback on
+		 */
+		event: 'mouseenter' | 'mouseleave';
+		/**
+		 * The callback function
+		 */
+		callback: () => void;
+	}
+
+	/**
+	 * Data about the noise effect that will be applied to the icon.
+	 */
+	interface Noise {
+		/**
+		 * Timestamp (using Date.now()) from when this iteration of the noise was created.
+		 */
+		timestamp: number;
+		noise: {
+			/**
+			 * A double-number array which holds the data for each pixel at the specified position.
+			 */
+			data: number[][];
+			/**
+			 * A double-number array which holds the data about how fast each pixel changes opacity.
+			 */
+			velocity: number[][];
+		};
+	}
+
+	/**
+	 * Options for configuring the noise.
+	 */
+	interface NoiseOptions {
+		/**
+		 * The noise's transition speed. Use this to control how fast the noise changes it's opacity at a given point. Feel free to play around with this. Default is 128.
+		 */
+		transitionSpeed?: number;
+		/**
+		 * Controls how often the noise is updated (in ms). Default is 750.
+		 */
+		updateSpeed?: number;
+	}
+
+	/**
+	 * Creates an animated icon canvas that can be interacted with.
+	 */
+	class AnimatedIconCanvas {
+		private canvas: HTMLCanvasElement;
+		private context: CanvasRenderingContext2D;
+
+		private icon: Icon;
+		private iconString: string | null = null;
+
+		private callbacks: Callback[] = [];
+
+		private currentNoise: Noise | null = null;
+		private animateNoise = false;
+
+		private NOISE_WIDTH: number;
+		private NOISE_HEIGHT: number;
+
+		private NOISE_TRANSITION_SPEED: number;
+		private NOISE_UPDATE_SPEED: number;
+
+		/**
+		 * Creates a canvas with an icon that changes color and becomes noisy when hovered over. Inspired by [Vercel's Website](https://vercel.com).
+		 * @param canvas - The canvas element to render the icon on.
+		 * @param icon - A path to the SVG icon and the color it should change to when hovered over. Since this runs client-side, the icon should be in the `public/` directory. Additionally, all `fill` attributes must be set to `currentColor`.
+		 */
+		constructor(canvas: HTMLCanvasElement | null, icon: Icon, noiseOpts?: NoiseOptions) {
+			if (!canvas) {
+				throw new Error('Canvas element not found');
+			}
+
+			this.canvas = canvas;
+			this.icon = icon;
+
+			// The noise we want to show might be based on white noise, but normally white noise has a resolution that is way too high.
+			// The solution is to create our noise at a lower resolution (1/8th in this case) and scale it up later.
+			this.NOISE_WIDTH = Math.ceil(this.canvas.width / 8);
+			this.NOISE_HEIGHT = Math.ceil(this.canvas.height / 8);
+
+			this.NOISE_TRANSITION_SPEED = noiseOpts?.transitionSpeed || 128;
+			this.NOISE_UPDATE_SPEED = noiseOpts?.updateSpeed || 750;
+
+			const context = canvas.getContext('2d');
+
+			if (!context) {
+				throw new Error('Failed to get 2D context from canvas');
+			}
+
+			this.context = context;
+
+			this.loadIcon();
+			this.initListeners();
+		}
+
+		/**
+		 * Loads the icon from the specified path as text and replaces the `currentColor` fill
+		 */
+		private loadIcon = async () => {
+			const image = await (await fetch(this.icon.path)).text();
+			this.iconString = image;
+
+			const colored = this.iconString.replace(/fill="currentColor"/g, `fill="${this.icon.initialColor}"`);
+			this.renderIcon(colored, false);
+		}
+
+		/**
+		 * Sets up the DOM listeners for hovering.
+		 */
+		private initListeners = () => {
+			this.canvas.addEventListener('mouseenter', this.handleMouseEnter);
+			this.canvas.addEventListener('mouseleave', this.handleMouseLeave);
+		}
+
+		/**
+		 * Converts a hex color string to RGB values.
+		 * @param hex The hex color to convert
+		 */
+		private hexToRGB = (hex: string) => {
+			var result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+			return result ? {
+				r: parseInt(result[1], 16),
+				g: parseInt(result[2], 16),
+				b: parseInt(result[3], 16)
+			} : { r: 0, g: 0, b: 0 };
+		}
+
+		/**
+		 * Takes in some image data and overlays it on the canvas. 
+		 * 
+		 * @note Normally, it is impossible to "scale" an image on a canvas. The workaround is to create a temporary canvas and scale it up instead.
+		 * @param noise - The noise image data.
+		 */
+		private overlayNoise = (noise: ImageData) => {
+			const tempCanvas = document.createElement('canvas');
+			tempCanvas.width = noise.width;
+			tempCanvas.height = noise.height;
+			const tempContext = tempCanvas.getContext('2d')!;
+
+			tempContext.putImageData(noise, 0, 0);
+
+			// NOTE: This directive is the center piece of the effect. It basically tells the canvas that new content can only be drawn on top of
+			// already existing data. This is how we achieve the mask effect of drawing noise only above the image!
+			this.context.globalCompositeOperation = 'source-atop';
+			this.context.drawImage(tempCanvas, 0, 0, tempCanvas.width, tempCanvas.height, 0, 0, this.canvas.width, this.canvas.height);
+		}
+
+		/**
+		 * Updates the noise based on the velocity. 
+		 */
+		private updateNoise = () => {
+			if (!this.currentNoise) return;
+
+			const noiseData = this.currentNoise.noise.data;
+			const noiseVelocity = this.currentNoise.noise.velocity;
+
+			for (let y = 0; y < this.NOISE_HEIGHT; y++) {
+				for (let x = 0; x < this.NOISE_WIDTH; x++) {
+					noiseData[y][x] = noiseData[y][x] + noiseVelocity[y][x] * this.NOISE_TRANSITION_SPEED;
+
+					if (noiseData[y][x] > 255) {
+						noiseData[y][x] = 255;
+						noiseVelocity[y][x] *= -1;
+					} else if (noiseData[y][x] < 0) {
+						noiseData[y][x] = 0;
+						noiseVelocity[y][x] *= -1;
+					}
+				}
+			}
+
+			this.currentNoise.timestamp = Date.now();
+		}
+
+		/**
+		 * Creates image data based on the current noise information.
+		 */
+		private createNoiseImage = (): ImageData => {
+			const image = this.context.createImageData(this.NOISE_WIDTH, this.NOISE_HEIGHT);
+
+			const noiseData = this.currentNoise!.noise.data;
+
+			for (let y = 0; y < this.NOISE_HEIGHT; y++) {
+				for (let x = 0; x < this.NOISE_WIDTH; x++) {
+					const gray = noiseData[y][x];
+
+					const alpha = 1 - gray / 255;
+
+					const offset = (y * this.NOISE_WIDTH + x) * 4;
+
+					image.data[offset] = 0;
+					image.data[offset + 1] = 0;
+					image.data[offset + 2] = 0;
+					image.data[offset + 3] = (alpha * 255) * .75;
+				}
+			}
+
+			return image;
+		}
+
+		/**
+		 * Renders the icon on the canvas and applies noise if necessary.
+		 * @param svg - The SVG string of the icon
+		 * @param noise - Whether to show the noise or not
+		 */
+		private renderIcon = (svg: string, noise?: boolean) => {
+			// Turn the image into an object URL so the canvas can load it
+			const asBlob = new Blob([svg], { type: 'image/svg+xml' });
+			const url = URL.createObjectURL(asBlob);
+
+			const img = new Image();
+
+			// Once the image has loaded, center it.
+			img.onload = () => {
+				const x = (this.canvas.width - img.width) / 2;
+				const y = (this.canvas.height - img.height) / 2;
+
+				this.context.drawImage(img, x, y, img.width, img.height);
+
+				if (!noise || !this.animateNoise) return;
+
+				// If there is no noise data, create two new arrays and populate them with some random data (that's all that "noise" really is!)
+				if (!this.currentNoise) {
+					this.currentNoise = {
+						timestamp: Date.now(),
+						noise: {
+							data: Array.from({ length: this.NOISE_HEIGHT }, () => Array.from({ length: this.NOISE_WIDTH }, () => Math.random() * 255)),
+							velocity: Array.from({ length: this.NOISE_HEIGHT }, () => Array.from({ length: this.NOISE_WIDTH }, () => Math.random() * 2 - 1))
+						}
+					};
+				}
+
+				// Check against the update speed and update if necessary
+				if (Date.now() - this.currentNoise.timestamp > this.NOISE_UPDATE_SPEED) {
+					this.updateNoise();
+				}
+
+				const newNoise = this.createNoiseImage();
+				this.overlayNoise(newNoise);
+			};
+
+			img.src = url;
+
+			if (this.icon.width) img.width = this.icon.width;
+			if (this.icon.height) img.height = this.icon.height;
+		}
+
+		/**
+		 * This function is responsible for easing the color of the icon.
+		 * @param from - The initial color of the icon
+		 * @param to - The color that the icon should "transition" to
+		 * @param duration - The duration of the transition
+		 * @param noise - Whether or not to show noise, passed to the `renderIcon` function
+		 */
+		private fadeIconToColor = (from: string, to: string, duration: number, noise: boolean) => {
+			const start = Date.now();
+
+			const animate = () => {
+				if (!this.iconString) return;
+
+				const elapsed = Date.now() - start;
+				const progress = elapsed / duration;
+
+				// If we've already finished transitioning the color, we only need to render the noise, so we return early.
+				if (progress >= 1) {
+					const colored = this.iconString.replace(/fill="currentColor"/g, `fill="${to}"`);
+					this.renderIcon(colored, true);
+					if (this.animateNoise) requestAnimationFrame(animate);
+					return;
+				}
+				
+				const { r: fromR, g: fromG, b: fromB } = this.hexToRGB(from);
+				const { r: toR, g: toG, b: toB } = this.hexToRGB(to);
+
+				// Interpolate the color based on the current progress
+				const r = fromR + (toR - fromR) * progress;
+				const g = fromG + (toG - fromG) * progress;
+				const b = fromB + (toB - fromB) * progress;
+
+				const colored = this.iconString.replace(/fill="currentColor"/g, `fill="rgb(${r}, ${g}, ${b})"`);
+
+				this.renderIcon(colored, noise);
+
+				requestAnimationFrame(animate);
+			};
+
+			animate();
+		}
+
+		/**
+		 * Callback for when the user hovers the canvas. Starts the fade animation and triggers all user-registered callbacks
+		 */
+		private handleMouseEnter = () => {
+			this.animateNoise = true;
+			this.fadeIconToColor('#ffffff', this.icon.activeColor, 150, true);
+
+			const mouseEnterCallbacks = this.callbacks.filter((callback) => callback.event === 'mouseenter');
+			for (const callback of mouseEnterCallbacks) {
+				callback.callback();
+			}
+		}
+
+		/**
+		 * Callback for when the user stops hovering the canvas. Starts the fade animation (backwards this time) and triggers all user-registered callbacks
+		 */
+		private handleMouseLeave = () => {
+			this.animateNoise = false;
+			this.fadeIconToColor(this.icon.activeColor, '#ffffff', 150, false);
+
+			const mouseLeaveCallbacks = this.callbacks.filter((callback) => callback.event === 'mouseleave');
+			for (const callback of mouseLeaveCallbacks) {
+				callback.callback();
+			}
+		}
+
+		/**
+		 * This function allows you to register a callback for when a user starts or stops hovering the canvas. Useful if you want to replicate the rotating text on Vercel's website!
+		 * @param event - The event to listen for
+		 * @param callback - The callback function
+		 */
+		public registerCallback = (event: 'mouseenter' | 'mouseleave', callback: () => void) => {
+			this.callbacks.push({ event, callback });
+		}
+	}
+
+	const canvas = document.querySelector<HTMLCanvasElement>('#icon-canvas');
+	new AnimatedIconCanvas(canvas, {
+		// DON'T FORGET THAT THIS PAGE HAS A `base` SET! IT NEEDS TO BE INCLUDED IN THE PATH!
+		path: '/vercel-icon-effect/astro-icon-light.svg',
+		initialColor: '#ffffff',
+		activeColor: '#8c5cf5',
+		// width: 100,
+		// height: 100,
+	}/*, {
+		transitionSpeed: 128,
+		updateSpeed: 750,
+	}*/);
+</script>
+<style>
+	* {
+		box-sizing: border-box;
+		margin: 0;
+	}
+	
+	html, body {
+		background-color: #0b0b0b;
+		color: white;
+	}
+
+	body {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 100vw;
+		height: 100vh;
+	}
+
+	#icon-canvas {
+		border: 1px solid #353535;
+		width: 150px;
+		height: 150px;
+	}
+</style>
